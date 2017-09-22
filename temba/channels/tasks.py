@@ -1,4 +1,4 @@
-from __future__ import unicode_literals
+from __future__ import print_function, unicode_literals
 
 import requests
 import logging
@@ -14,6 +14,7 @@ from temba.msgs.models import SEND_MSG_TASK, MSG_QUEUE
 from temba.utils import dict_to_struct
 from temba.utils.queues import start_task, push_task, nonoverlapping_task, complete_task
 from temba.utils.mage import MageClient
+from temba.temba_celery import app as celery_app
 from .models import Channel, Alert, ChannelLog, ChannelCount
 
 
@@ -26,10 +27,28 @@ class MageStreamAction(Enum):
     deactivate = 3
 
 
-@task(track_started=True, name='sync_channel_task')
-def sync_channel_task(gcm_id, channel_id=None):  # pragma: no cover
+@celery_app.on_after_finalize.connect
+def setup_periodic_tasks(sender, **kwargs):
+    try:
+        from .types import TYPES
+        for channel_type in TYPES.values():
+            channel_type.setup_periodic_tasks(sender)
+    except Exception as e:  # pragma: no cover
+        # we print this out because celery just silently swallows exceptions here
+        import traceback
+        traceback.print_exc(e)
+
+
+@task(track_started=True, name='sync_channel_gcm_task')
+def sync_channel_gcm_task(cloud_registration_id, channel_id=None):  # pragma: no cover
     channel = Channel.objects.filter(pk=channel_id).first()
-    Channel.sync_channel(gcm_id, channel)
+    Channel.sync_channel_gcm(cloud_registration_id, channel)
+
+
+@task(track_started=True, name='sync_channel_fcm_task')
+def sync_channel_fcm_task(cloud_registration_id, channel_id=None):  # pragma: no cover
+    channel = Channel.objects.filter(pk=channel_id).first()
+    Channel.sync_channel_fcm(cloud_registration_id, channel)
 
 
 @task(track_started=True, name='send_msg_task')
@@ -56,7 +75,13 @@ def send_msg_task():
             while msg_tasks:
                 msg_task = msg_tasks.pop(0)
                 msg = dict_to_struct('MockMsg', msg_task,
-                                     datetime_fields=['modified_on', 'sent_on', 'created_on', 'queued_on', 'next_attempt'])
+                                     datetime_fields=['modified_on', 'sent_on', 'created_on', 'queued_on',
+                                                      'next_attempt'])
+
+                # we renamed msg.session_id to msg.connection_id but might still have queued messages with the former
+                if hasattr(msg, 'session_id'):
+                    msg.connection_id = msg.session_id
+
                 Channel.send_message(msg)
 
                 # if there are more messages to send for this contact, sleep a second before moving on
@@ -88,19 +113,30 @@ def send_alert_task(alert_id, resolved):
     alert.send_email(resolved)
 
 
+@task(track_started=True, name='refresh_jiochat_access_tokens')
+def refresh_jiochat_access_tokens(channel_id=None):
+    Channel.refresh_all_jiochat_access_token(channel_id=channel_id)
+
+
 @nonoverlapping_task(track_started=True, name='trim_channel_log_task')
 def trim_channel_log_task():  # pragma: needs cover
     """
     Runs daily and clears any channel log items older than 48 hours.
     """
 
-    # keep success messages for only two days
-    two_days_ago = timezone.now() - timedelta(hours=48)
-    ChannelLog.objects.filter(created_on__lte=two_days_ago, is_error=False).delete()
+    # keep success messages for only SUCCESS_LOGS_TRIM_TIME hours
+    success_logs_trim_time = settings.SUCCESS_LOGS_TRIM_TIME
 
-    # keep errors for 30 days
-    month_ago = timezone.now() - timedelta(days=30)
-    ChannelLog.objects.filter(created_on__lte=month_ago).delete()
+    # keep all errors for ALL_LOGS_TRIM_TIME days
+    all_logs_trim_time = settings.ALL_LOGS_TRIM_TIME
+
+    if success_logs_trim_time:
+        success_log_later = timezone.now() - timedelta(hours=success_logs_trim_time)
+        ChannelLog.objects.filter(created_on__lte=success_log_later, is_error=False).delete()
+
+    if all_logs_trim_time:
+        all_log_later = timezone.now() - timedelta(hours=all_logs_trim_time)
+        ChannelLog.objects.filter(created_on__lte=all_log_later).delete()
 
 
 @task(track_started=True, name='notify_mage_task')
@@ -108,12 +144,11 @@ def notify_mage_task(channel_uuid, action):
     """
     Notifies Mage of a change to a Twitter channel
     """
+    action = MageStreamAction[action]
     mage = MageClient(settings.MAGE_API_URL, settings.MAGE_AUTH_TOKEN)
 
     if action == MageStreamAction.activate:
         mage.activate_twitter_stream(channel_uuid)
-    elif action == MageStreamAction.refresh:
-        mage.refresh_twitter_stream(channel_uuid)
     elif action == MageStreamAction.deactivate:
         mage.deactivate_twitter_stream(channel_uuid)
     else:  # pragma: no cover
@@ -122,7 +157,7 @@ def notify_mage_task(channel_uuid, action):
 
 @nonoverlapping_task(track_started=True, name="squash_channelcounts", lock_key='squash_channelcounts')
 def squash_channelcounts():
-    ChannelCount.squash_counts()
+    ChannelCount.squash()
 
 
 @task(track_started=True, name="fb_channel_subscribe")
@@ -137,4 +172,4 @@ def fb_channel_subscribe(channel_id):
                                  params=dict(access_token=page_access_token))
 
         if response.status_code != 200 or not response.json()['success']:
-            print "Unable to subscribe for delivery of events: %s" % response.content
+            print("Unable to subscribe for delivery of events: %s" % response.content)

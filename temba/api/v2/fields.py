@@ -21,6 +21,21 @@ def validate_size(value, max_size):
         raise serializers.ValidationError("This field can only contain up to %d items." % max_size)
 
 
+def validate_translations(value, base_language, max_length):
+    if len(value) == 0:
+        raise serializers.ValidationError("Must include at least one translation.")
+    if base_language not in value:
+        raise serializers.ValidationError("Must include translation for base language '%s'" % base_language)
+
+    for lang, trans in six.iteritems(value):
+        if not isinstance(lang, six.string_types) or (lang != 'base' and len(lang) > 3):
+            raise serializers.ValidationError("Language code %s is not valid." % six.text_type(lang))
+        if not isinstance(trans, six.string_types):
+            raise serializers.ValidationError("Translations must be strings.")
+        if len(trans) > max_length:
+            raise serializers.ValidationError("Ensure translations have no more than %d characters." % max_length)
+
+
 def validate_urn(value, strict=True):
     try:
         normalized = URN.normalize(value)
@@ -30,6 +45,35 @@ def validate_urn(value, strict=True):
     except ValueError:
         raise serializers.ValidationError("Invalid URN: %s. Ensure phone numbers contain country codes." % value)
     return normalized
+
+
+class TranslatableField(serializers.Field):
+    """
+    A field which is either a simple string or a translations dict
+    """
+    def __init__(self, **kwargs):
+        self.max_length = kwargs.pop('max_length', None)
+        super(TranslatableField, self).__init__(**kwargs)
+
+    def to_representation(self, obj):
+        return obj
+
+    def to_internal_value(self, data):
+        org = self.context['org']
+        base_language = org.primary_language.iso_code if org.primary_language else 'base'
+
+        if isinstance(data, six.string_types):
+            if len(data) > self.max_length:
+                raise serializers.ValidationError("Ensure this field has no more than %d characters." % self.max_length)
+
+            data = {base_language: data}
+
+        elif isinstance(data, dict):
+            validate_translations(data, base_language, self.max_length)
+        else:
+            raise serializers.ValidationError("Value must be a string or dict of strings.")
+
+        return data, base_language
 
 
 class LimitedListField(serializers.ListField):
@@ -109,6 +153,9 @@ class TembaModelField(serializers.RelatedField):
         return {'uuid': obj.uuid, 'name': obj.name}
 
     def to_internal_value(self, data):
+        if not (isinstance(data, six.string_types) or isinstance(data, six.integer_types)):
+            raise serializers.ValidationError("Must be a string or integer")
+
         obj = self.get_object(data)
 
         if not obj:
@@ -142,11 +189,11 @@ class ContactField(TembaModelField):
     def get_object(self, value):
         # try to normalize as URN but don't blow up if it's a UUID
         try:
-            as_urn = URN.normalize(value)
+            as_urn = URN.identity(URN.normalize(value))
         except ValueError:
             as_urn = value
 
-        return self.get_queryset().filter(Q(uuid=value) | Q(urns__urn=as_urn)).first()
+        return self.get_queryset().filter(Q(uuid=value) | Q(urns__identity=as_urn)).first()
 
 
 class ContactFieldField(TembaModelField):

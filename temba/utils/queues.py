@@ -1,4 +1,4 @@
-from __future__ import unicode_literals
+from __future__ import print_function, unicode_literals
 
 import json
 import time
@@ -23,7 +23,7 @@ def push_task(org, queue, task_name, args, priority=DEFAULT_PRIORITY):
     """
     Adds a task to queue_name with the supplied arguments.
 
-    Ex: add_task(nyaruka, 'flows', 'start_flow', [1,2,3,4,5,6,7,8,9,10])
+    Ex: push_task(nyaruka, 'flows', 'start_flow', [1,2,3,4,5,6,7,8,9,10])
     """
     r = get_redis_connection('default')
 
@@ -57,7 +57,7 @@ def start_task(task_name):
     """
     Pops the next 'random' task off our queue, returning the arguments that were saved
 
-    Ex: pop_next_task('start_flow')
+    Ex: start_task('start_flow')
     <<< {flow=5, contacts=[1,2,3,4,5,6,7,8,9,10]}
     """
     r = get_redis_connection('default')
@@ -110,7 +110,7 @@ def lookup_task_function(task_name):
     """
     task_map = getattr(settings, 'CELERY_TASK_MAP', None)
     if not task_map:  # pragma: needs cover
-        print "Empty or missing CELERY_TASK_MAP in settings.py, unable to find task for %s" % task_name
+        print("Empty or missing CELERY_TASK_MAP in settings.py, unable to find task for %s" % task_name)
 
     task_function = task_map.get(task_name, None)
     if not task_function:  # pragma: needs cover

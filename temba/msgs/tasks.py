@@ -1,9 +1,9 @@
-from __future__ import unicode_literals
+from __future__ import print_function, unicode_literals
 
 import logging
 import six
 import time
-
+import json
 
 from celery.task import task
 from collections import defaultdict
@@ -13,11 +13,12 @@ from django.db import transaction, connection
 from django.db.models import Count
 from django.utils import timezone
 from django_redis import get_redis_connection
-from temba.utils.mage import mage_handle_new_message, mage_handle_new_contact
+from temba.contacts.models import Contact, STOP_CONTACT_EVENT
+from temba.utils import json_date_to_datetime, chunk_list, analytics
+from temba.utils.mage import handle_new_message, handle_new_contact
 from temba.utils.queues import start_task, complete_task, nonoverlapping_task
-from temba.utils import json_date_to_datetime, chunk_list
 from .models import Msg, Broadcast, BroadcastRecipient, ExportMessagesTask, PENDING, HANDLE_EVENT_TASK, MSG_EVENT
-from .models import FIRE_EVENT, TIMEOUT_EVENT, SystemLabel
+from .models import FIRE_EVENT, TIMEOUT_EVENT, LabelCount, SystemLabelCount
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ def process_run_timeout(run_id, timeout_on):
         key = 'pcm_%d' % run.contact_id
         if not r.get(key):
             with r.lock(key, timeout=120):
-                print "T[%09d] Processing timeout" % run.id
+                print("T[%09d] Processing timeout" % run.id)
                 start = time.time()
 
                 run.refresh_from_db()
@@ -44,38 +45,89 @@ def process_run_timeout(run_id, timeout_on):
                 if run.timeout_on and abs(run.timeout_on - timeout_on) < timedelta(milliseconds=1):
                     run.resume_after_timeout(timeout_on)
                 else:
-                    print "T[%09d] .. skipping timeout, already handled" % run.id
+                    print("T[%09d] .. skipping timeout, already handled" % run.id)
 
-                print "T[%09d] %08.3f s" % (run.id, time.time() - start)
+                print("T[%09d] %08.3f s" % (run.id, time.time() - start))
 
 
-@task(track_started=True, name='process_message_task')  # pragma: no cover
-def process_message_task(msg_id, from_mage=False, new_contact=False):
-    """
-    Processes a single incoming message through our queue.
-    """
-    r = get_redis_connection()
-    msg = Msg.objects.filter(pk=msg_id, status=PENDING).select_related('org', 'contact', 'contact_urn', 'channel').first()
+def process_fire_events(fire_ids):
+    from temba.campaigns.models import EventFire
 
-    # somebody already handled this message, move on
-    if not msg:  # pragma: needs cover
+    # every event fire in the batch will be for the same flow... but if the flow has been deleted then fires won't exist
+    single_fire = EventFire.objects.filter(id__in=fire_ids).first()
+    if not single_fire:  # pragma: no cover
         return
 
-    # get a lock on this contact, we process messages one by one to prevent odd behavior in flow processing
-    key = 'pcm_%d' % msg.contact_id
-    if not r.get(key):
-        with r.lock(key, timeout=120):
-            print "M[%09d] Processing - %s" % (msg.id, msg.text)
+    flow = single_fire.event.flow
+
+    # lock on the flow so we know non-one else is updating these event fires
+    r = get_redis_connection()
+    with r.lock('process_fire_events:%d' % flow.id, timeout=300):
+
+        # only fetch fires that haven't been somehow already handled
+        fires = list(EventFire.objects.filter(id__in=fire_ids, fired=None).prefetch_related('contact'))
+        if fires:
+            print("E[%s][%s] Batch firing %d events..." % (flow.org.name, flow.name, len(fires)))
+
             start = time.time()
+            EventFire.batch_fire(fires, flow)
 
-            # if message was created in Mage...
-            if from_mage:
-                mage_handle_new_message(msg.org, msg)
-                if new_contact:
-                    mage_handle_new_contact(msg.org, msg.contact)
+            print("E[%s][%s] Finished batch firing events in %.3f s" % (flow.org.name, flow.name, time.time() - start))
 
-            Msg.process_message(msg)
-            print "M[%09d] %08.3f s - %s" % (msg.id, time.time() - start, msg.text)
+
+def process_message(msg, new_message=False, new_contact=False):
+    """
+    Processes the passed in message dealing with new contacts or mage messages appropriately.
+    """
+    print("M[%09d] Processing - %s" % (msg.id, msg.text))
+    start = time.time()
+
+    # if message was created in Mage...
+    if new_message:
+        handle_new_message(msg.org, msg)
+        if new_contact:
+            handle_new_contact(msg.org, msg.contact)
+
+    Msg.process_message(msg)
+    print("M[%09d] %08.3f s - %s" % (msg.id, time.time() - start, msg.text))
+
+
+@task(track_started=True, name='process_message_task')
+def process_message_task(msg_event):
+    """
+    Given the task JSON from our queue, processes the message, is two implementations to deal with
+    backwards compatibility of using contact queues (second branch can be removed later)
+    """
+    r = get_redis_connection()
+
+    # we have a contact id, we want to get the msg from that queue after acquiring our lock
+    if msg_event.get('contact_id'):
+        key = 'pcm_%d' % msg_event['contact_id']
+        contact_queue = Msg.CONTACT_HANDLING_QUEUE % msg_event['contact_id']
+
+        # wait for the lock as we want to make sure to process the next message as soon as we are free
+        with r.lock(key, timeout=120):
+            # pop the next message to process off our contact queue
+            with r.pipeline() as pipe:
+                pipe.zrange(contact_queue, 0, 0)
+                pipe.zremrangebyrank(contact_queue, 0, 0)
+                (contact_msg, deleted) = pipe.execute()
+
+            if contact_msg:
+                msg_event = json.loads(contact_msg[0])
+                msg = Msg.objects.filter(id=msg_event['id'], status=PENDING).select_related('org', 'contact', 'contact_urn', 'channel').first()
+
+                if msg:
+                    process_message(msg, msg_event.get('from_mage', msg_event.get('new_message', False)), msg_event.get('new_contact', False))
+
+    # backwards compatibility for events without contact ids, we handle the message directly
+    else:
+        msg = Msg.objects.filter(id=msg_event['id'], status=PENDING).select_related('org', 'contact', 'contact_urn', 'channel').first()
+        if msg:
+            # grab our contact lock and handle this message
+            key = 'pcm_%d' % msg.contact_id
+            with r.lock(key, timeout=120):
+                process_message(msg, msg_event.get('from_mage', False), msg_event.get('new_contact', False))
 
 
 @task(track_started=True, name='send_broadcast')
@@ -84,6 +136,33 @@ def send_broadcast_task(broadcast_id):
     from .models import Broadcast
     broadcast = Broadcast.objects.get(pk=broadcast_id)
     broadcast.send()
+
+
+@task(track_started=True, name='send_to_flow_node')
+def send_to_flow_node(org_id, user_id, text, **kwargs):
+    from django.contrib.auth.models import User
+    from temba.contacts.models import Contact
+    from temba.orgs.models import Org
+    from temba.flows.models import FlowStep
+
+    org = Org.objects.get(pk=org_id)
+    user = User.objects.get(pk=user_id)
+    simulation = kwargs.get('simulation', 'false') == 'true'
+    step_uuid = kwargs.get('s', None)
+
+    qs = Contact.objects.filter(org=org, is_blocked=False, is_stopped=False, is_active=True, is_test=simulation)
+
+    steps = FlowStep.objects.filter(run__is_active=True, step_uuid=step_uuid,
+                                    left_on=None, run__flow__org=org).distinct('contact').select_related('contact')
+    contact_uuids = [f.contact.uuid for f in steps]
+    contacts = qs.filter(uuid__in=contact_uuids).order_by('name')
+
+    recipients = list(contacts)
+    broadcast = Broadcast.create(org, user, text, recipients)
+    broadcast.send()
+
+    analytics.track(user.username, 'temba.broadcast_created',
+                    dict(contacts=len(contacts), groups=0, urns=0))
 
 
 @task(track_started=True, name='send_spam')
@@ -100,7 +179,7 @@ def send_spam(user_id, contact_id):  # pragma: no cover
     channel = contact.org.get_send_channel(TEL_SCHEME)
 
     if not channel:  # pragma: no cover
-        print "Sorry, no channel to be all spammy with"
+        print("Sorry, no channel to be all spammy with")
         return
 
     long_text = "Test Message #%d. The path of the righteous man is beset on all sides by the iniquities of the " \
@@ -160,7 +239,6 @@ def check_messages_task():  # pragma: needs cover
     Checks to see if any of our aggregators have errored messages that need to be retried.
     Also takes care of flipping Contacts from Failed to Normal and back based on their status.
     """
-    from django.utils import timezone
     from .models import INCOMING, PENDING
     from temba.orgs.models import Org
     from temba.channels.tasks import send_msg_task
@@ -196,13 +274,11 @@ def check_messages_task():  # pragma: needs cover
 
 
 @task(track_started=True, name='export_sms_task')
-def export_sms_task(id):  # pragma: needs cover
+def export_messages_task(export_id):
     """
     Export messages to a file and e-mail a link to the user
     """
-    export_task = ExportMessagesTask.objects.filter(pk=id).first()
-    if export_task:
-        export_task.start_export()
+    ExportMessagesTask.objects.get(id=export_id).perform()
 
 
 @task(track_started=True, name="handle_event_task", time_limit=180, soft_time_limit=120)
@@ -212,13 +288,11 @@ def handle_event_task():
     messages that need to be handled.
 
     Currently three types of events may be "popped" from our queue:
-           msg - Which contains the id of the Msg to be processed
-          fire - Which contains the id of the EventFire that needs to be fired
-       timeout - Which contains a run that timed out and needs to be resumed
+             msg - Which contains the id of the Msg to be processed
+            fire - Which contains the id of the EventFire that needs to be fired
+         timeout - Which contains a run that timed out and needs to be resumed
+    stop_contact - Which contains the contact id to stop
     """
-    from temba.campaigns.models import EventFire
-    r = get_redis_connection()
-
     # pop off the next task
     org_id, event_task = start_task(HANDLE_EVENT_TASK)
 
@@ -228,24 +302,19 @@ def handle_event_task():
 
     try:
         if event_task['type'] == MSG_EVENT:
-            process_message_task(event_task['id'], event_task.get('from_mage', False), event_task.get('new_contact', False))
+            process_message_task(event_task)
 
         elif event_task['type'] == FIRE_EVENT:
-            # use a lock to make sure we don't do two at once somehow
-            key = 'fire_campaign_%s' % event_task['id']
-            if not r.get(key):
-                with r.lock(key, timeout=120):
-                    event = EventFire.objects.filter(pk=event_task['id'], fired=None)\
-                                             .select_related('event', 'event__campaign', 'event__campaign__org').first()
-                    if event:
-                        print "E[%09d] Firing for org: %s" % (event.id, event.event.campaign.org.name)
-                        start = time.time()
-                        event.fire()
-                        print "E[%09d] %08.3f s" % (event.id, time.time() - start)
+            fire_ids = event_task.get('fires') if 'fires' in event_task else [event_task.get('id')]
+            process_fire_events(fire_ids)
 
         elif event_task['type'] == TIMEOUT_EVENT:
             timeout_on = json_date_to_datetime(event_task['timeout_on'])
             process_run_timeout(event_task['run'], timeout_on)
+
+        elif event_task['type'] == STOP_CONTACT_EVENT:
+            contact = Contact.objects.get(id=event_task['contact_id'])
+            contact.stop(contact.modified_by)
 
         else:  # pragma: needs cover
             raise Exception("Unexpected event type: %s" % event_task)
@@ -336,14 +405,15 @@ def purge_broadcasts_task():
 
         print("[PURGE] Purged %d of %d broadcasts (%d messages deleted)" % (bcasts_purged, len(purge_ids), msgs_deleted))
 
-    Debit.squash_purge_debits()
+    Debit.squash()
 
     print("[PURGE] Finished purging %d broadcasts older than %s, deleting %d messages" % (len(purge_ids), purge_before, msgs_deleted))
 
 
 @nonoverlapping_task(track_started=True, name="squash_systemlabels")
-def squash_systemlabels():
-    SystemLabel.squash_counts()
+def squash_labelcounts():
+    SystemLabelCount.squash()
+    LabelCount.squash()
 
 
 @nonoverlapping_task(track_started=True, name='clear_old_msg_external_ids', time_limit=60 * 60 * 36)

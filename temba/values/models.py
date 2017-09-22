@@ -1,8 +1,10 @@
-from __future__ import absolute_import, unicode_literals
+from __future__ import absolute_import, print_function, unicode_literals
 
+import six
 import time
 
 from collections import defaultdict
+from django.conf import settings
 from django.db import models, connection
 from django.db.models import Q
 from django.utils.translation import ugettext_lazy as _
@@ -11,7 +13,6 @@ from temba.locations.models import AdminBoundary
 from temba.orgs.models import Org
 from temba.utils import format_decimal, get_dict_from_cursor, dict_to_json, json_to_dict
 from stop_words import safe_get_stop_words
-
 
 VALUE_SUMMARY_CACHE_KEY = 'value_summary'
 CONTACT_KEY = 'vsd::vsc%d'
@@ -22,6 +23,7 @@ RULESET_KEY = 'vsd::vsr%d'
 VALUE_SUMMARY_CACHE_TIME = 60 * 60 * 24 * 30
 
 
+@six.python_2_unicode_compatible
 class Value(models.Model):
     """
     A Value is created to store the most recent result for a step in a flow. Value will store typed
@@ -53,6 +55,8 @@ class Value(models.Model):
                    (AUDIO, _("Audio")),
                    (IMAGE, _("Image")))
 
+    MAX_VALUE_LEN = settings.VALUE_FIELD_SIZE
+
     contact = models.ForeignKey('contacts.Contact', related_name='values')
 
     contact_field = models.ForeignKey('contacts.ContactField', null=True, on_delete=models.SET_NULL,
@@ -70,8 +74,8 @@ class Value(models.Model):
     category = models.CharField(max_length=128, null=True,
                                 help_text="The name of the category this value matched in the RuleSet")
 
-    string_value = models.TextField(max_length=640,
-                                    help_text="The string value or string representation of this value")
+    string_value = models.TextField(help_text="The string value or string representation of this value")
+
     decimal_value = models.DecimalField(max_digits=36, decimal_places=8, null=True,
                                         help_text="The decimal value of this value if any.")
     datetime_value = models.DateTimeField(null=True,
@@ -286,7 +290,8 @@ class Value(models.Model):
             set_contacts = contacts & set_contacts
             unset_contacts = contacts - set_contacts
 
-        print "RulesetSummary [%f]: %s contact_field: %s with filters: %s" % (time.time() - start, ruleset, contact_field, filters)
+        print("RulesetSummary [%f]: %s contact_field: %s with filters: %s"
+              % (time.time() - start, ruleset, contact_field, filters))
 
         if return_contacts:
             return (set_contacts, unset_contacts, categories)
@@ -562,7 +567,7 @@ class Value(models.Model):
                 # sort by count, then alphabetically
                 categories = sorted(categories, key=lambda c: (-c['count'], c['label']))
 
-            results.append(dict(label=unicode(_("All")), open_ended=open_ended, set=set_count, unset=unset_count, categories=categories))
+            results.append(dict(label=six.text_type(_("All")), open_ended=open_ended, set=set_count, unset=unset_count, categories=categories))
 
         # for each of our dependencies, add our key as something that depends on it
         pipe = r.pipeline()
@@ -586,7 +591,7 @@ class Value(models.Model):
 
         return results
 
-    def __unicode__(self):  # pragma: needs cover
+    def __str__(self):  # pragma: needs cover
         if self.ruleset:
             return "Contact: %d - %s = %s" % (self.contact.pk, self.ruleset.label, self.category)
         elif self.contact_field:

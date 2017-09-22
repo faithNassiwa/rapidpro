@@ -1,5 +1,6 @@
 from __future__ import absolute_import, unicode_literals
 
+import itertools
 import six
 
 from django import forms
@@ -9,6 +10,7 @@ from django.db import transaction
 from django.http import HttpResponse, JsonResponse
 from django.utils.translation import ugettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
+from enum import Enum
 from rest_framework import generics, mixins, status, views
 from rest_framework.pagination import CursorPagination
 from rest_framework.parsers import MultiPartParser, FormParser
@@ -19,11 +21,12 @@ from smartmin.views import SmartTemplateView, SmartFormView
 from temba.api.models import APIToken, Resthook, ResthookSubscriber, WebHookEvent
 from temba.campaigns.models import Campaign, CampaignEvent
 from temba.channels.models import Channel, ChannelEvent
-from temba.contacts.models import Contact, ContactURN, ContactGroup, ContactField, URN
+from temba.contacts.models import Contact, ContactURN, ContactGroup, ContactGroupCount, ContactField, URN
 from temba.flows.models import Flow, FlowRun, FlowStep, FlowStart, RuleSet
 from temba.locations.models import AdminBoundary, BoundaryAlias
-from temba.msgs.models import Broadcast, Msg, Label, SystemLabel
+from temba.msgs.models import Broadcast, Msg, Label, LabelCount, SystemLabel
 from temba.utils import str_to_bool, json_date_to_datetime, splitting_getlist
+from uuid import UUID
 from .serializers import AdminBoundaryReadSerializer, BroadcastReadSerializer, BroadcastWriteSerializer
 from .serializers import CampaignReadSerializer, CampaignWriteSerializer, CampaignEventReadSerializer
 from .serializers import CampaignEventWriteSerializer, ChannelReadSerializer, ChannelEventReadSerializer
@@ -79,14 +82,24 @@ class RootView(views.APIView):
 
     The success or failure of requests is represented by status codes as well as a message in the response body:
 
-     * **200**: A list or update request was successful
-     * **201**: A resource was successfully created (only returned for `POST` requests)
+     * **200**: A list or update request was successful.
+     * **201**: A resource was successfully created (only returned for `POST` requests).
      * **204**: An empty response - used for both successful `DELETE` requests and `POST` requests that update multiple
                 resources.
      * **400**: The request failed due to invalid parameters. Do not retry with the same values, and the body of the
                 response will contain details.
-     * **403**: You do not have permission to access this resource
-     * **404**: The resource was not found (returned by `POST` and `DELETE` methods)
+     * **403**: You do not have permission to access this resource.
+     * **404**: The resource was not found (returned by `POST` and `DELETE` methods).
+     * **429**: You have exceeded the rate limit for this endpoint (see below).
+
+    ## Rate Limiting
+
+    All endpoints are subject to rate limiting. If you exceed the number of allowed requests in a given time window, you
+    will get a response with status code 429. The response will also include a header called 'Retry-After' which will
+    specify the number of seconds that you should wait for before making further requests.
+
+    The rate limit for all endpoints is 2,500 requests per hour. It is important to honor the Retry-After header when
+    encountering 429 responses as the limit is subject to change without notice.
 
     ## Date Values
 
@@ -106,6 +119,11 @@ class RootView(views.APIView):
      * **mailto:jack@example.com**
 
     Phone numbers should always be given in full [E164 format](http://en.wikipedia.org/wiki/E.164).
+
+    ## Translatable Values
+
+    Some endpoints return or accept text fields that may be translated into different languages. These should be objects
+    with ISO-639-2 language codes as keys, e.g. `{"eng": "Hello", "fre": "Bonjour"}`
 
     ## Authentication
 
@@ -300,6 +318,20 @@ class BaseAPIView(generics.GenericAPIView):
 
         return generics.get_object_or_404(queryset)
 
+    def get_int_param(self, name):
+        param = self.request.query_params.get(name)
+        try:
+            return int(param) if param is not None else None
+        except ValueError:
+            raise InvalidQueryError("Value for %s must be an integer" % name)
+
+    def get_uuid_param(self, name):
+        param = self.request.query_params.get(name)
+        try:
+            return UUID(param) if param is not None else None
+        except ValueError:
+            raise InvalidQueryError("Value for %s must be a valid UUID" % name)
+
     def get_serializer_context(self):
         context = super(BaseAPIView, self).get_serializer_context()
         context['org'] = self.request.user.get_org()
@@ -311,7 +343,7 @@ class BaseAPIView(generics.GenericAPIView):
             raise InvalidQueryError("URN lookups not allowed for anonymous organizations")
 
         try:
-            return URN.normalize(value)
+            return URN.identity(URN.normalize(value))
         except ValueError:
             raise InvalidQueryError("Invalid URN: %s" % value)
 
@@ -565,7 +597,7 @@ class BroadcastsEndpoint(ListAPIMixin, WriteAPIMixin, BaseAPIView):
      * **urns** - the URNs that received the broadcast (array of strings)
      * **contacts** - the contacts that received the broadcast (array of objects)
      * **groups** - the groups that received the broadcast (array of objects)
-     * **text** - the message text (string)
+     * **text** - the message text (string or translations object)
      * **created_on** - when this broadcast was either created (datetime) (filterable as `before` and `after`).
 
     Example:
@@ -592,7 +624,7 @@ class BroadcastsEndpoint(ListAPIMixin, WriteAPIMixin, BaseAPIView):
 
     A `POST` allows you to create and send new broadcasts, with the following JSON data:
 
-      * **text** - the text of the message to send (string, limited to 480 characters)
+      * **text** - the text of the message to send (string, limited to 640 characters)
       * **urns** - the URNs of contacts to send to (array of up to 100 strings, optional)
       * **contacts** - the UUIDs of contacts to send to (array of up to 100 strings, optional)
       * **groups** - the UUIDs of contact groups to send to (array of up to 100 strings, optional)
@@ -625,15 +657,14 @@ class BroadcastsEndpoint(ListAPIMixin, WriteAPIMixin, BaseAPIView):
     pagination_class = CreatedOnCursorPagination
 
     def filter_queryset(self, queryset):
-        params = self.request.query_params
         org = self.request.user.get_org()
 
         queryset = queryset.filter(is_active=True)
 
         # filter by id (optional)
-        msg_id = params.get('id')
-        if msg_id:
-            queryset = queryset.filter(id=msg_id)
+        broadcast_id = self.get_int_param('id')
+        if broadcast_id:
+            queryset = queryset.filter(id=broadcast_id)
 
         queryset = queryset.prefetch_related(
             Prefetch('contacts', queryset=Contact.objects.only('uuid', 'name')),
@@ -641,7 +672,7 @@ class BroadcastsEndpoint(ListAPIMixin, WriteAPIMixin, BaseAPIView):
         )
 
         if not org.is_anon:
-            queryset = queryset.prefetch_related(Prefetch('urns', queryset=ContactURN.objects.only('urn')))
+            queryset = queryset.prefetch_related(Prefetch('urns', queryset=ContactURN.objects.only('scheme', 'path', 'display')))
 
         return self.filter_before_after(queryset, 'created_on')
 
@@ -810,7 +841,7 @@ class CampaignEventsEndpoint(ListAPIMixin, WriteAPIMixin, DeleteAPIMixin, BaseAP
      * **offset** - the offset from our contact field (positive or negative integer).
      * **unit** - the unit for our offset (one of "minutes, "hours", "days", "weeks").
      * **delivery_hour** - the hour of the day to deliver the message (integer 0-24, -1 indicates send at the same hour as the contact field).
-     * **message** - the message to send to the contact if this is a message event (string)
+     * **message** - the message to send to the contact if this is a message event (string or translations object)
      * **flow** - the UUID and name of the flow if this is a flow event (object).
      * **created_on** - when the event was created (datetime).
 
@@ -872,7 +903,7 @@ class CampaignEventsEndpoint(ListAPIMixin, WriteAPIMixin, DeleteAPIMixin, BaseAP
             "offset": 160,
             "unit": "W",
             "delivery_hour": -1,
-            "message": "Feeling sick and helpless, lost the compass where self is."
+            "message": {"eng": "Feeling sick and helpless, lost the compass where self is."},
             "flow": null,
             "created_on": "2013-08-19T19:11:21.088453Z"
         }
@@ -1121,9 +1152,9 @@ class ChannelEventsEndpoint(ListAPIMixin, BaseAPIView):
         org = self.request.user.get_org()
 
         # filter by id (optional)
-        call_id = params.get('id')
+        call_id = self.get_int_param('id')
         if call_id:
-            queryset = queryset.filter(pk=call_id)
+            queryset = queryset.filter(id=call_id)
 
         # filter by contact (optional)
         contact_uuid = params.get('contact')
@@ -1221,7 +1252,7 @@ class ContactsEndpoint(ListAPIMixin, WriteAPIMixin, DeleteAPIMixin, BaseAPIView)
             "name": "Ben Haggerty",
             "language": "eng",
             "urns": ["tel:+250788123123", "twitter:ben"],
-            "groups": [{"name": "Devs", "uuid": "6685e933-26e1-4363-a468-8f7268ab63a9"}],
+            "groups": ["6685e933-26e1-4363-a468-8f7268ab63a9"],
             "fields": {
               "nickname": "Macklemore",
               "side_kick": "Ryan Lewis"
@@ -1289,7 +1320,7 @@ class ContactsEndpoint(ListAPIMixin, WriteAPIMixin, DeleteAPIMixin, BaseAPIView)
     write_serializer_class = ContactWriteSerializer
     pagination_class = ModifiedOnCursorPagination
     throttle_scope = 'v2.contacts'
-    lookup_params = {'uuid': 'uuid', 'urn': 'urns__urn'}
+    lookup_params = {'uuid': 'uuid', 'urn': 'urns__identity'}
 
     def filter_queryset(self, queryset):
         params = self.request.query_params
@@ -1306,7 +1337,7 @@ class ContactsEndpoint(ListAPIMixin, WriteAPIMixin, DeleteAPIMixin, BaseAPIView)
         # filter by URN (optional)
         urn = params.get('urn')
         if urn:
-            queryset = queryset.filter(urns__urn=self.normalize_urn(urn))
+            queryset = queryset.filter(urns__identity=self.normalize_urn(urn))
 
         # filter by group name/uuid (optional)
         group_ref = params.get('group')
@@ -1341,7 +1372,7 @@ class ContactsEndpoint(ListAPIMixin, WriteAPIMixin, DeleteAPIMixin, BaseAPIView)
         queryset = self.get_queryset().filter(**self.lookup_values)
 
         # don't blow up if posted a URN that doesn't exist - we'll let the serializer create a new contact
-        if self.request.method == 'POST' and 'urns__urn' in self.lookup_values:
+        if self.request.method == 'POST' and 'urns__identity' in self.lookup_values:
             return queryset.first()
         else:
             return generics.get_object_or_404(queryset)
@@ -1540,6 +1571,11 @@ class DefinitionsEndpoint(BaseAPIView):
     """
     permission = 'orgs.org_api'
 
+    class Depends(Enum):
+        none = 0
+        flows = 1
+        all = 2
+
     def get(self, request, *args, **kwargs):
         org = request.user.get_org()
         params = request.query_params
@@ -1551,40 +1587,30 @@ class DefinitionsEndpoint(BaseAPIView):
             flow_uuids = params.getlist('flow')
             campaign_uuids = params.getlist('campaign')
 
-        dependency_type = params.get('dependencies', 'all')
-        depends = dependency_type != 'none'
+        include = params.get('dependencies', 'all')
+        if include not in DefinitionsEndpoint.Depends.__members__:
+            raise InvalidQueryError("dependencies must be one of %s" % ', '.join(DefinitionsEndpoint.Depends.__members__))
+
+        include = DefinitionsEndpoint.Depends[include]
 
         if flow_uuids:
-            flows = set(Flow.objects.filter(uuid__in=flow_uuids, org=org))
+            flows = set(Flow.objects.filter(uuid__in=flow_uuids, org=org, is_active=True))
         else:
             flows = set()
 
-        # any fetched campaigns
-        campaigns = []
         if campaign_uuids:
-            campaigns = Campaign.objects.filter(uuid__in=campaign_uuids, org=org)
+            campaigns = set(Campaign.objects.filter(uuid__in=campaign_uuids, org=org, is_active=True))
+        else:
+            campaigns = set()
 
-            if depends:
-                for campaign in campaigns:
-                    for event in campaign.events.filter(event_type=CampaignEvent.TYPE_FLOW, is_active=True).exclude(flow=None):
-                        flows.add(event.flow)
+        if include == DefinitionsEndpoint.Depends.none:
+            components = set(itertools.chain(flows, campaigns))
+        elif include == DefinitionsEndpoint.Depends.flows:
+            components = org.resolve_dependencies(flows, campaigns, include_campaigns=False, include_triggers=True)
+        else:
+            components = org.resolve_dependencies(flows, campaigns, include_campaigns=True, include_triggers=True)
 
-        # get any dependencies on our flows and campaigns
-        dependencies = dict(flows=set(), campaigns=set(campaigns), triggers=set(), groups=set())
-        for flow in flows:
-            if depends:
-                include_campaigns = dependency_type == 'all'
-                dependencies = flow.get_dependencies(dependencies=dependencies, include_campaigns=include_campaigns)
-
-        # make sure our requested items are included flows we requested are included
-        to_export = dict(flows=dependencies['flows'],
-                         campaigns=dependencies['campaigns'],
-                         triggers=dependencies['triggers'])
-
-        # add in our primary requested flows
-        to_export['flows'].update(flows)
-
-        export = org.export_definitions(self.request.branding['link'], **to_export)
+        export = org.export_definitions(self.request.branding['link'], components)
 
         return Response(export, status=status.HTTP_200_OK)
 
@@ -1739,13 +1765,14 @@ class FlowsEndpoint(ListAPIMixin, BaseAPIView):
      * **labels** - the labels for this flow (array of objects)
      * **expires** - the time (in minutes) when this flow's inactive contacts will expire (integer)
      * **created_on** - when this flow was created (datetime)
+     * **modified_on** - when this flow was last modified (datetime), filterable as `before` and `after`.
      * **runs** - the counts of completed, interrupted and expired runs (object)
 
     Example:
 
         GET /api/v2/flows.json
 
-    Response containing the groups for your organization:
+    Response containing the flows for your organization:
 
         {
             "next": null,
@@ -1758,7 +1785,9 @@ class FlowsEndpoint(ListAPIMixin, BaseAPIView):
                     "labels": [{"name": "Important", "uuid": "5a4eb79e-1b1f-4ae3-8700-09384cca385f"}],
                     "expires": 600,
                     "created_on": "2016-01-06T15:33:00.813162Z",
+                    "modified_on": "2017-01-07T13:14:00.453567Z",
                     "runs": {
+                        "active": 47,
                         "completed": 123,
                         "interrupted": 2,
                         "expired": 34
@@ -1783,7 +1812,7 @@ class FlowsEndpoint(ListAPIMixin, BaseAPIView):
 
         queryset = queryset.prefetch_related('labels')
 
-        return queryset
+        return self.filter_before_after(queryset, 'modified_on')
 
     @classmethod
     def get_read_explorer(cls):
@@ -1793,7 +1822,9 @@ class FlowsEndpoint(ListAPIMixin, BaseAPIView):
             'url': reverse('api.v2.flows'),
             'slug': 'flow-list',
             'params': [
-                {'name': "uuid", 'required': False, 'help': "A flow UUID filter by. ex: 5f05311e-8f81-4a67-a5b5-1501b6d6496a"}
+                {'name': "uuid", 'required': False, 'help': "A flow UUID filter by. ex: 5f05311e-8f81-4a67-a5b5-1501b6d6496a"},
+                {'name': 'before', 'required': False, 'help': "Only return flows modified before this date, ex: 2017-01-28T18:00:00.000"},
+                {'name': 'after', 'required': False, 'help': "Only return flows modified after this date, ex: 2017-01-28T18:00:00.000"}
             ]
         }
 
@@ -1904,6 +1935,11 @@ class GroupsEndpoint(ListAPIMixin, WriteAPIMixin, DeleteAPIMixin, BaseAPIView):
             queryset = queryset.filter(name__iexact=name)
 
         return queryset.filter(is_active=True)
+
+    def prepare_for_serialization(self, object_list):
+        group_counts = ContactGroupCount.get_totals(object_list)
+        for group in object_list:
+            group.count = group_counts[group]
 
     @classmethod
     def get_read_explorer(cls):
@@ -2049,6 +2085,11 @@ class LabelsEndpoint(ListAPIMixin, WriteAPIMixin, DeleteAPIMixin, BaseAPIView):
             queryset = queryset.filter(name__iexact=name)
 
         return queryset.filter(is_active=True)
+
+    def prepare_for_serialization(self, object_list):
+        label_counts = LabelCount.get_totals(object_list)
+        for label in object_list:
+            label.count = label_counts[label]
 
     @classmethod
     def get_read_explorer(cls):
@@ -2220,7 +2261,7 @@ class MessagesEndpoint(ListAPIMixin, BaseAPIView):
         org = self.request.user.get_org()
 
         # filter by id (optional)
-        msg_id = params.get('id')
+        msg_id = self.get_int_param('id')
         if msg_id:
             queryset = queryset.filter(id=msg_id)
 
@@ -2254,7 +2295,7 @@ class MessagesEndpoint(ListAPIMixin, BaseAPIView):
         # use prefetch rather than select_related for foreign keys to avoid joins
         queryset = queryset.prefetch_related(
             Prefetch('contact', queryset=Contact.objects.only('uuid', 'name')),
-            Prefetch('contact_urn', queryset=ContactURN.objects.only('urn')),
+            Prefetch('contact_urn', queryset=ContactURN.objects.only('scheme', 'path', 'display')),
             Prefetch('channel', queryset=Channel.objects.only('uuid', 'name')),
             Prefetch('labels', queryset=Label.label_objects.only('uuid', 'name')),
         )
@@ -2361,6 +2402,7 @@ class OrgEndpoint(BaseAPIView):
             "primary_language": "eng",
             "timezone": "Africa/Kigali",
             "date_style": "day_first",
+            "credits": {"used": 121433, "remaining": 3452},
             "anon": false
         }
     """
@@ -2376,6 +2418,7 @@ class OrgEndpoint(BaseAPIView):
             'primary_language': org.primary_language.iso_code if org.primary_language else None,
             'timezone': six.text_type(org.timezone),
             'date_style': ('day_first' if org.get_dayfirst() else 'month_first'),
+            'credits': {'used': org.get_credits_used(), 'remaining': org.get_credits_remaining()},
             'anon': org.is_anon
         }
 
@@ -2529,7 +2572,7 @@ class ResthookSubscribersEndpoint(ListAPIMixin, WriteAPIMixin, DeleteAPIMixin, B
         params = self.request.query_params
 
         # filter by id (optional)
-        subscriber_id = params.get('id')
+        subscriber_id = self.get_int_param('id')
         if subscriber_id:
             queryset = queryset.filter(id=subscriber_id)
 
@@ -2756,7 +2799,7 @@ class RunsEndpoint(ListAPIMixin, BaseAPIView):
                 queryset = queryset.filter(pk=-1)
 
         # filter by id (optional)
-        run_id = params.get('id')
+        run_id = self.get_int_param('id')
         if run_id:
             queryset = queryset.filter(id=run_id)
 
@@ -2781,6 +2824,7 @@ class RunsEndpoint(ListAPIMixin, BaseAPIView):
         queryset = queryset.prefetch_related(
             Prefetch('flow', queryset=Flow.objects.only('uuid', 'name', 'base_language')),
             Prefetch('contact', queryset=Contact.objects.only('uuid', 'name', 'language')),
+            Prefetch('start', queryset=FlowStart.objects.only('uuid')),
             Prefetch('values'),
             Prefetch('values__ruleset', queryset=RuleSet.objects.only('uuid', 'label')),
             Prefetch('steps', queryset=FlowStep.objects.only('run', 'step_uuid', 'arrived_on').order_by('arrived_on'))
@@ -2816,7 +2860,7 @@ class FlowStartsEndpoint(ListAPIMixin, WriteAPIMixin, BaseAPIView):
     By making a `GET` request you can list all the manual flow starts on your organization, in the order of last
     modified. Each flow start has the following attributes:
 
-     * **id** - the id of this flow start (integer)
+     * **uuid** - the UUID of this flow start (string)
      * **flow** - the flow which was started (object)
      * **contacts** - the list of contacts that were started in the flow (objects)
      * **groups** - the list of groups that were started in the flow (objects)
@@ -2837,7 +2881,7 @@ class FlowStartsEndpoint(ListAPIMixin, WriteAPIMixin, BaseAPIView):
             "previous": null,
             "results": [
                 {
-                    "id": 150051,
+                    "uuid": "09d23a05-47fe-11e4-bfe9-b8f6b119e9ab",
                     "flow": {"uuid": "f5901b62-ba76-4003-9c62-72fdacc1b7b7", "name": "Thrift Shop"},
                     "groups": [
                          {"uuid": "f5901b62-ba76-4003-9c62-72fdacc1b7b7", "name": "Ryan & Macklemore"}
@@ -2885,7 +2929,7 @@ class FlowStartsEndpoint(ListAPIMixin, WriteAPIMixin, BaseAPIView):
     Response is the created flow start:
 
         {
-            "id": 150051,
+            "uuid": "09d23a05-47fe-11e4-bfe9-b8f6b119e9ab",
             "flow": {"uuid": "f5901b62-ba76-4003-9c62-72fdacc1b7b7", "name": "Thrift Shop"},
             "groups": [
                  {"uuid": "f5901b62-ba76-4003-9c62-72fdacc1b7b7", "name": "Ryan & Macklemore"}
@@ -2915,12 +2959,15 @@ class FlowStartsEndpoint(ListAPIMixin, WriteAPIMixin, BaseAPIView):
         return self.model.objects.filter(flow__org=org, is_active=True)
 
     def filter_queryset(self, queryset):
-        params = self.request.query_params
-
-        # filter by id (optional)
-        start_id = params.get('id')
+        # filter by id (optional and deprecated)
+        start_id = self.get_int_param('id')
         if start_id:
             queryset = queryset.filter(id=start_id)
+
+        # filter by UUID (optional)
+        uuid = self.get_uuid_param('uuid')
+        if uuid:
+            queryset = queryset.filter(uuid=uuid)
 
         # use prefetch rather than select_related for foreign keys to avoid joins
         queryset = queryset.prefetch_related(
