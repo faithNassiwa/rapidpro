@@ -1,4 +1,5 @@
-from __future__ import absolute_import, print_function, unicode_literals
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import, division, print_function, unicode_literals
 
 import base64
 import hashlib
@@ -6,9 +7,12 @@ import hmac
 import json
 import requests
 
+from six.moves.urllib.parse import quote_plus
+
 from django.conf import settings
 from django.db.models import Model
 from django.utils.http import urlencode
+from django.utils.encoding import force_bytes, force_text
 from twython import Twython
 from twython import TwythonAuthError
 from twython import TwythonError
@@ -27,7 +31,7 @@ class TembaTwython(Twython):  # pragma: no cover
     @classmethod
     def from_channel(cls, channel):
         # could be passed a ChannelStruct or a Channel model instance
-        config = channel.config_json() if isinstance(channel, Model) else channel.config
+        config = channel.config if isinstance(channel, Model) else channel.config
 
         # Twitter channels come in new (i.e. user app, webhook API) and classic (shared app, streaming API) flavors
         if 'api_key' in config:
@@ -45,7 +49,7 @@ class TembaTwython(Twython):  # pragma: no cover
         params = params or {}
 
         func = getattr(self.client, method)
-        params, files = _transparent_params(params)
+        params, files = (params, None) if 'event' in params else _transparent_params(params)
 
         requests_args = {}
         for k, v in self.client_args.items():
@@ -57,8 +61,8 @@ class TembaTwython(Twython):  # pragma: no cover
             requests_args['params'] = params
         else:
             requests_args.update({
-                'data': params,
-                'files': files,
+                'data': json.dumps(params) if 'event' in params else params,
+                'files': files
             })
         try:
             if method == 'get':
@@ -130,48 +134,41 @@ class TembaTwython(Twython):  # pragma: no cover
 
         return content
 
-    def get_webhooks(self):  # pragma: no cover
+    def get_webhooks(self, env_name):
         """
-        Returns all URLs and their statuses for the given app.
-
-        Docs: https://dev.twitter.com/webhooks/reference/get/account_activity/webhooks
+        Returns the webhooks currently active for this app. (Twitter claims there can only be one)
+        Docs: https://developer.twitter.com/en/docs/accounts-and-users/subscribe-account-activity/api-reference/aaa-standard-all
         """
-        return self.get('account_activity/webhooks')
+        return self.get('https://api.twitter.com/1.1/account_activity/all/%s/webhooks.json' % env_name)
 
-    def recheck_webhook(self, webhook_id):  # pragma: no cover
+    def delete_webhook(self, env_name):
         """
-        Triggers the challenge response check (CRC) for the given webhook's URL.
-
-        Docs: https://dev.twitter.com/webhooks/reference/put/account_activity/webhooks
+        Deletes the webhook for the current app / user and passed in environment name.
+        Docs: https://developer.twitter.com/en/docs/accounts-and-users/subscribe-account-activity/api-reference/aaa-standard-all
         """
-        return self.request('account_activity/webhooks/%s' % webhook_id, method='PUT')
+        # grab our current webhooks
+        resp = self.get_webhooks(env_name)
 
-    def register_webhook(self, url):
+        # if we have one, delete it
+        if len(resp) > 0:
+            self.request('https://api.twitter.com/1.1/account_activity/all/%s/webhooks/%s.json' % (env_name, resp[0]['id']), method='DELETE')
+
+    def register_webhook(self, env_name, url):
         """
         Registers a new webhook URL for the given application context.
-
-        Docs: https://dev.twitter.com/webhooks/reference/post/account_activity/webhooks
+        Docs: https://developer.twitter.com/en/docs/accounts-and-users/subscribe-account-activity/api-reference/aaa-standard-all
         """
-        return self.post('account_activity/webhooks', params={'url': url})
+        set_webhook_url = 'https://api.twitter.com/1.1/account_activity/all/%s/webhooks.json?url=%s' % (env_name, quote_plus(url))
+        return self.post(set_webhook_url)
 
-    def delete_webhook(self, webhook_id):
+    def subscribe_to_webhook(self, env_name):
         """
-        Removes the webhook from the provided application's configuration.
-
-        Docs: https://dev.twitter.com/webhooks/reference/del/account_activity/webhooks
-
+        Subscribes all user's events for this apps webhook
+        Docs: https://developer.twitter.com/en/docs/accounts-and-users/subscribe-account-activity/api-reference/aaa-standard-all
         """
-        return self.request('account_activity/webhooks/%s' % webhook_id, method='DELETE')
-
-    def subscribe_to_webhook(self, webhook_id):
-        """
-        Subscribes the provided app to events for the provided user context.
-
-        Docs: https://dev.twitter.com/webhooks/reference/post/account_activity/webhooks/subscriptions
-        """
-        return self.post('account_activity/webhooks/%s/subscriptions' % webhook_id)
+        return self.post('https://api.twitter.com/1.1/account_activity/all/%s/subscriptions.json' % env_name)
 
 
 def generate_twitter_signature(content, consumer_secret):
-    token = hmac.new(bytes(consumer_secret.encode('ascii')), msg=content, digestmod=hashlib.sha256).digest()
-    return 'sha256=' + base64.standard_b64encode(token)
+    token = hmac.new(force_bytes(consumer_secret.encode('ascii')), msg=force_bytes(content), digestmod=hashlib.sha256).digest()
+    return 'sha256=' + force_text(base64.standard_b64encode(token))
